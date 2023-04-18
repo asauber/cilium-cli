@@ -185,11 +185,14 @@ func (k *K8sInstaller) UpgradeWithHelm(ctx context.Context, k8sClient genericcli
 		Wait:         k.params.Wait,
 		WaitDuration: k.params.WaitDuration,
 
-		// In addition to the DryRun i/o, we need to tell Helm not to execute the upgrade
+		// In addition to the DryRun output, we need to tell Helm to not execute the upgrade
 		DryRun:           k.params.DryRun,
 		DryRunHelmValues: k.params.DryRunHelmValues,
 	}
 	release, err := helm.Upgrade(ctx, k8sClient, upgradeParams)
+	if err != nil {
+		return err
+	}
 
 	if k.params.DryRun {
 		fmt.Println(release.Manifest)
