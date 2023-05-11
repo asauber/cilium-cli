@@ -880,6 +880,7 @@ func getCiliumVersionFromImage(image string) (string, error) {
 	if isNamed {
 		path := reference.Path(named)
 		strs := strings.Split(path, "/")
+		fmt.Printf("%v\n", strs)
 
 		// Take the last element as an image name
 		imageName := strs[len(strs)-1]

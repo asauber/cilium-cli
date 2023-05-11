@@ -46,15 +46,22 @@ func NewK8sUninstaller(client k8sInstallerImplementation, p UninstallParameters)
 		client: client,
 		params: p,
 	}
-	ciliumVersion, err := client.GetRunningCiliumVersion(context.Background(), p.Namespace)
+	pods, err := client.ListPods(context.Background(), p.Namespace,
+		metav1.ListOptions{LabelSelector: defaults.AgentPodSelector})
+	if err != nil {
+		uninstaller.Log("❌ Failed to list pods: %v", err)
+	}
+	version, err := client.(*k8s.Client).GetCiliumVersion(context.Background(),
+		&pods.Items[0])
 	if err != nil {
 		uninstaller.Log("Error getting Cilium Version: %s", err)
 	}
-	version, err := semver.ParseTolerant(ciliumVersion)
+	fmt.Printf("%v\n", version)
+	//version, err := semver.ParseTolerant(ciliumVersion)
 	if err != nil {
 		uninstaller.Log("Error parsing Cilium Version: %s", err)
 	} else {
-		uninstaller.version = version
+		uninstaller.version = *version
 	}
 	return uninstaller
 }
