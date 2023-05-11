@@ -46,6 +46,11 @@ func NewK8sUninstaller(client k8sInstallerImplementation, p UninstallParameters)
 		client: client,
 		params: p,
 	}
+	// TODO (ajs):
+	//   Implement multiple version retrieval strategies
+	//   First: attempt to get version by Pod exec
+	//   Second: attempt to get version by tagname "RunningCiliumVersion"
+	//   Third: Log on failiure and don't bail
 	pods, err := client.ListPods(context.Background(), p.Namespace,
 		metav1.ListOptions{LabelSelector: defaults.AgentPodSelector})
 	if err != nil {
