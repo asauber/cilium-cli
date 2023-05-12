@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1809,4 +1810,300 @@ func DisableWithHelm(ctx context.Context, k8sClient *k8s.Client, params Paramete
 	}
 	_, err = helm.Upgrade(ctx, k8sClient.RESTClientGetter, upgradeParams)
 	return err
+}
+
+func ConnectWithHelm(ctx context.Context, k8sClient *k8s.Client, params Parameters) error {
+	// Use Kubernetes clients to build Helm values for Clustermesh Helm values
+
+	remoteCluster, err := k8s.NewClient(params.DestinationContext, "")
+	if err != nil {
+		return fmt.Errorf("unable to create Kubernetes client to access remote cluster %q: %w", params.DestinationContext, err)
+	}
+
+	aiRemote, err := extractAccessInformation(ctx, params, remoteCluster,
+		params.DestinationEndpoints, true, false)
+	if err != nil {
+		fmt.Fprintf(os.Stdout, "❌ Unable to retrieve access information of remote cluster %q: %s", remoteCluster.ClusterName(), err)
+		return err
+	}
+
+	if !aiRemote.validate() {
+		return fmt.Errorf("remote cluster has non-unique name (%s) and/or ID (%s)", aiRemote.ClusterName, aiRemote.ClusterID)
+	}
+
+	aiLocal, err := extractAccessInformation(ctx, params, k8sClient, params.SourceEndpoints,
+		true,
+		false)
+	if err != nil {
+		fmt.Fprintf(os.Stdout, "❌ Unable to retrieve access information of local cluster %q: %s", k.client.ClusterName(), err)
+		return err
+	}
+
+	if !aiLocal.validate() {
+		return fmt.Errorf("local cluster has the default name (cluster name: %s) and/or ID 0 (cluster ID: %s)",
+			aiLocal.ClusterName, aiLocal.ClusterID)
+	}
+
+	cid, err := strconv.Atoi(aiRemote.ClusterID)
+	if err != nil {
+		return fmt.Errorf("remote cluster has non-numeric cluster ID %s. Only numeric values 1-255 are allowed", aiRemote.ClusterID)
+	}
+	if cid < 1 || cid > 255 {
+		return fmt.Errorf("remote cluster has cluster ID %d out of acceptable range (1-255)", cid)
+	}
+
+	if aiRemote.ClusterName == aiLocal.ClusterName {
+		return fmt.Errorf("remote and local cluster have the same, non-unique name: %s", aiLocal.ClusterName)
+	}
+
+	if aiRemote.ClusterID == aiLocal.ClusterID {
+		return fmt.Errorf("remote and local cluster have the same, non-unique ID: %s", aiLocal.ClusterID)
+	}
+
+	fmt.Fprintf(os.Stdout, "✨ Connecting cluster %s -> %s...", k8sClient.ClusterName(), remoteCluster.ClusterName())
+	if err := patchConfig(ctx, k.client, aiRemote); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stdout, "✨ Connecting cluster %s -> %s...", remoteCluster.ClusterName(), k.client.ClusterName())
+	if err := patchConfig(ctx, remoteCluster, aiLocal); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stdout, "✅ Connected cluster %s and %s!", k8sClient.ClusterName(), remoteCluster.ClusterName())
+
+	helmStrValues := []string{
+		"clustermesh.useAPIServer=true",
+		fmt.Sprintf("clustermesh.apiserver.service.type=%s", params.ServiceType),
+	}
+
+	vals, err := helm.ParseVals(helmStrValues)
+	if err != nil {
+		return err
+	}
+
+	upgradeParams := helm.UpgradeParameters{
+		Namespace:   params.Namespace,
+		Name:        defaults.HelmReleaseName,
+		Values:      vals,
+		ResetValues: false,
+		ReuseValues: true,
+	}
+
+	_, err = helm.Upgrade(ctx, k8sClient.RESTClientGetter, upgradeParams)
+	return err
+}
+
+func extractAccessInformation(
+	ctx context.Context,
+	params Parameters,
+	client k8sClusterMeshImplementation,
+	endpoints []string,
+	verbose bool,
+	getExternalWorkLoadSecret bool,
+) (*accessInformation, error) {
+	cm, err := client.GetConfigMap(ctx, params.Namespace, defaults.ConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve ConfigMap %q: %w", defaults.ConfigMapName, err)
+	}
+
+	if _, ok := cm.Data[configNameClusterName]; !ok {
+		return nil, fmt.Errorf("%s is not set in ConfigMap %q", configNameClusterName, defaults.ConfigMapName)
+	}
+
+	clusterID := cm.Data[configNameClusterID]
+	clusterName := cm.Data[configNameClusterName]
+
+	if verbose {
+		fmt.Fprintf(os.Stdout, "✨ Extracting access information of cluster %s...", clusterName)
+	}
+	svc, err := client.GetService(ctx, params.Namespace, defaults.ClusterMeshServiceName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("unable to get clustermesh service %q: %w", defaults.ClusterMeshServiceName, err)
+	}
+
+	if verbose {
+		fmt.Fprintf(os.Stdout, "🔑 Extracting secrets from cluster %s...", clusterName)
+	}
+	caSecret, err := client.GetSecret(ctx, params.Namespace, defaults.CASecretName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("unable to get secret %q to retrieve CA: %s", defaults.CASecretName, err)
+	}
+
+	caCert, ok := caSecret.Data[defaults.CASecretCertName]
+	if !ok {
+		return nil, fmt.Errorf("secret %q does not contain CA cert %q", defaults.CASecretName, defaults.CASecretCertName)
+	}
+
+	meshSecret, err := getSecret(ctx, client, defaults.ClusterMeshRemoteSecretName)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get client secret to access clustermesh service: %w", err)
+	}
+
+	clientKey, ok := meshSecret.Data[corev1.TLSPrivateKeyKey]
+	if !ok {
+		return nil, fmt.Errorf("secret %q does not contain key %q", meshSecret.Name, corev1.TLSPrivateKeyKey)
+	}
+
+	clientCert, ok := meshSecret.Data[corev1.TLSCertKey]
+	if !ok {
+		return nil, fmt.Errorf("secret %q does not contain key %q", meshSecret.Name, corev1.TLSCertKey)
+	}
+
+	// ExternalWorkload secret is created by 'clustermesh enable' command, but it isn't created by Helm. We should try to load this secret only when needed
+	var externalWorkloadKey, externalWorkloadCert []byte
+	if getExternalWorkLoadSecret {
+		externalWorkloadSecret, err := getSecret(ctx, client, defaults.ClusterMeshExternalWorkloadSecretName)
+		if err != nil {
+			return nil, fmt.Errorf("unable to get external workload secret to access clustermesh service")
+		}
+
+		externalWorkloadKey, ok = externalWorkloadSecret.Data[corev1.TLSPrivateKeyKey]
+		if !ok {
+			return nil, fmt.Errorf("secret %q does not contain key %q", externalWorkloadSecret.Namespace, corev1.TLSPrivateKeyKey)
+		}
+
+		externalWorkloadCert, ok = externalWorkloadSecret.Data[corev1.TLSCertKey]
+		if !ok {
+			return nil, fmt.Errorf("secret %q does not contain key %q", externalWorkloadSecret.Namespace, corev1.TLSCertKey)
+		}
+	}
+
+	ai := &accessInformation{
+		ClusterID:            clusterID,
+		ClusterName:          clusterName,
+		CA:                   caCert,
+		ClientKey:            clientKey,
+		ClientCert:           clientCert,
+		ExternalWorkloadKey:  externalWorkloadKey,
+		ExternalWorkloadCert: externalWorkloadCert,
+		ServiceIPs:           []string{},
+		Tunnel:               cm.Data[configNameTunnel],
+	}
+
+	switch {
+	case len(endpoints) > 0:
+		for _, endpoint := range endpoints {
+			ip, port, err := net.SplitHostPort(endpoint)
+			if err != nil {
+				return nil, fmt.Errorf("invalid endpoint %q, must be IP:PORT: %w", endpoint, err)
+			}
+
+			intPort, err := strconv.Atoi(port)
+			if err != nil {
+				return nil, fmt.Errorf("invalid port %q: %w", port, err)
+			}
+
+			if ai.ServicePort == 0 {
+				ai.ServicePort = intPort
+			} else if ai.ServicePort != intPort {
+				return nil, fmt.Errorf("port mismatch (%d != %d), all endpoints must use the same port number", ai.ServicePort, intPort)
+			}
+
+			ai.ServiceIPs = append(ai.ServiceIPs, ip)
+		}
+
+	case svc.Spec.Type == corev1.ServiceTypeClusterIP:
+		if len(svc.Spec.Ports) == 0 {
+			return nil, fmt.Errorf("port of service could not be derived, service has no ports")
+		}
+		if svc.Spec.Ports[0].Port == 0 {
+			return nil, fmt.Errorf("port is not set in service")
+		}
+		ai.ServicePort = int(svc.Spec.Ports[0].Port)
+
+		if svc.Spec.ClusterIP == "" {
+			return nil, fmt.Errorf("IP of service could not be derived, service has no ClusterIP")
+		}
+		ai.ServiceIPs = append(ai.ServiceIPs, svc.Spec.ClusterIP)
+
+	case svc.Spec.Type == corev1.ServiceTypeNodePort:
+		if len(svc.Spec.Ports) == 0 {
+			return nil, fmt.Errorf("port of service could not be derived, service has no ports")
+		}
+
+		if svc.Spec.Ports[0].NodePort == 0 {
+			return nil, fmt.Errorf("nodeport is not set in service")
+		}
+		ai.ServicePort = int(svc.Spec.Ports[0].NodePort)
+
+		nodes, err := client.ListNodes(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("unable to list nodes in cluster: %w", err)
+		}
+
+		for _, node := range nodes.Items {
+			nodeIP := ""
+			for _, address := range node.Status.Addresses {
+				switch address.Type {
+				case corev1.NodeExternalIP:
+					nodeIP = address.Address
+				case corev1.NodeInternalIP:
+					if nodeIP == "" {
+						nodeIP = address.Address
+					}
+				}
+			}
+
+			if nodeIP != "" {
+				ai.ServiceIPs = append(ai.ServiceIPs, nodeIP)
+
+				// We can't really support multiple nodes as
+				// the NodePort will be different and the
+				// current use of hostAliases will lead to
+				// DNS-style RR requiring all endpoints to use
+				// the same port
+				break
+			}
+		}
+		fmt.Fprintf(os.Stdout, "⚠️  Service type NodePort detected! Service may fail when nodes are removed from the cluster!")
+
+	case svc.Spec.Type == corev1.ServiceTypeLoadBalancer:
+		if len(svc.Spec.Ports) == 0 {
+			return nil, fmt.Errorf("port of service could not be derived, service has no ports")
+		}
+
+		ai.ServicePort = int(svc.Spec.Ports[0].Port)
+
+		for _, ingressStatus := range svc.Status.LoadBalancer.Ingress {
+			if ingressStatus.Hostname == "" {
+				ai.ServiceIPs = append(ai.ServiceIPs, ingressStatus.IP)
+			} else {
+				fmt.Fprintf(os.Stdout, "Hostname based ingress detected, trying to resolve it")
+
+				ips, err := net.LookupHost(ingressStatus.Hostname)
+				if err != nil {
+					fmt.Fprintf(os.Stdout, fmt.Sprintf("Could not resolve the hostname of the ingress, falling back to the static IP. Error: %v", err))
+					ai.ServiceIPs = append(ai.ServiceIPs, ingressStatus.IP)
+				} else {
+					fmt.Fprintf(os.Stdout, "Hostname resolved, using the found ip(s)")
+					ai.ServiceIPs = append(ai.ServiceIPs, ips...)
+				}
+			}
+		}
+	}
+
+	switch {
+	case len(ai.ServiceIPs) > 0:
+		if verbose {
+			fmt.Fprintf(os.Stdout, "ℹ️  Found ClusterMesh service IPs: %s", ai.ServiceIPs)
+		}
+	default:
+		return nil, fmt.Errorf("unable to derive service IPs automatically")
+	}
+
+	return ai, nil
+}
+
+// We had inconsistency in naming clustermesh secrets between Helm installation and Cilium CLI installation
+// Cilium CLI was naming clustermesh secrets with trailing 's'. eg. 'clustermesh-apiserver-client-certs' instead of `clustermesh-apiserver-client-cert`
+// This caused Cilium CLI 'clustermesh status' command to fail when Cilium is installed using Helm
+// getSecret handles both secret names and logs warning if deprecated secret name is found
+func (k *K8sClusterMesh) getSecret(ctx context.Context, client k8sClusterMeshImplementation, secretName string) (*corev1.Secret, error) {
+
+	secret, err := client.GetSecret(ctx, k.params.Namespace, secretName, metav1.GetOptions{})
+	if err != nil {
+		return k.getDeprecatedSecret(ctx, client, secretName, secretName)
+	}
+	return secret, err
 }
